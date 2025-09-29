@@ -1,0 +1,26 @@
+WITH RankedGrades AS (
+    SELECT
+        mh.staffnumber,
+        mh.forenames,
+        mh.surname,
+        mh.person_gradeshortname,
+        mh.validdate,
+        ROW_NUMBER() OVER (PARTITION BY mh.staffnumber ORDER BY mh.validdate DESC) AS rn
+    FROM [bronze_optima_optima_managed].[hoursassignment] mh
+    LEFT JOIN [bronze_chris21].[termination] ct ON mh.staffnumber = ct.staff_member
+    WHERE 
+        (teamname LIKE '%NURSE%' or mh.assigned_gradetypename = 'NURSE')
+        AND mh.staffnumber NOT LIKE '%Test%' COLLATE SQL_Latin1_General_CP1_CI_AS
+        AND (mh._fivetran_deleted IS NULL OR mh._fivetran_deleted = 0)
+        AND mh.cancelreasondescription IS NULL
+        AND (ct.last_date_worked IS NULL OR ct.last_date_worked >= CAST(GETDATE() AS DATE))
+)
+SELECT
+    staffnumber  AS employee_id,
+    forenames,
+    surname,
+    person_gradeshortname AS [qualification]
+    --validdate
+FROM RankedGrades
+WHERE rn = 1
+ORDER BY staffnumber;

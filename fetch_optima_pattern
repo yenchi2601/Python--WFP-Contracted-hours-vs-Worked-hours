@@ -1,0 +1,54 @@
+WITH PatternWithXML AS (
+    SELECT 
+        patternid, 
+        name,
+        TRY_CAST(sequences AS XML) AS sequences_xml,
+        _fivetran_deleted
+    FROM [bronze_optima_optima_advanced].[pattern]
+)
+SELECT DISTINCT
+    p.patternid                      AS [pattern_id],
+    p.name                           AS [pattern_name],
+    CAST(validfrom AS DATE)          AS [pattern_valid_from],
+    CAST(validto AS DATE)            AS [pattern_valid_to],
+    mh.staffnumber                   AS [employee_id],
+    mh.forenames                     AS [forenames],
+    mh.surname                       AS [surname],
+    pw.pwNode.value('@WeekIndex', 'INT') AS [week_index],
+   
+    CASE pwi.pwiNode.value('@Offset', 'INT')
+        WHEN 2 THEN 'Monday'
+        WHEN 3 THEN 'Tuesday'
+        WHEN 4 THEN 'Wednesday'
+        WHEN 5 THEN 'Thursday'
+        WHEN 6 THEN 'Friday'
+        ELSE 'Unknown'
+    END                               AS [day_name],
+    arl.name                          AS [roster_location],
+    ash.shifttype                     AS [shift_type],
+    ash.name                          AS [shift_name],
+    ash.starttime                     AS [start_time],
+    ash.endtime                       AS [end_time],
+    CAST(ash.worktime AS FLOAT) / 60  AS [work_time_hrs],
+    pwi.pwiNode.value('@Offset', 'INT') AS [offset],
+    pwi.pwiNode.value('(Shift/@ID)[1]', 'INT') AS [shift_id],
+    pwi.pwiNode.value('(RosterLocation/@ID)[1]', 'INT') AS [roster_location_id],
+    pwi.pwiNode.value('(Team/@ID)[1]', 'INT') AS [team_id]
+FROM PatternWithXML p
+OUTER APPLY p.sequences_xml.nodes('/Sequences/PatternWeekSequences/PatternWeekSequence') AS pw(pwNode)
+OUTER APPLY pw.pwNode.nodes('PatternWeekSequenceItems/PatternWeekSequenceItem') AS pwi(pwiNode)
+LEFT JOIN [bronze_optima_optima_advanced].[shift] ash               ON pwi.pwiNode.value('(Shift/@ID)[1]', 'INT') = ash.ShiftID
+LEFT JOIN [bronze_optima_optima_advanced].[rosterlocation] arl      ON pwi.pwiNode.value('(RosterLocation/@ID)[1]', 'INT') = arl.RosterLocationID
+LEFT JOIN [bronze_optima_optima_advanced].[patternassignment] apa   ON p.patternid = apa.patternid
+LEFT JOIN [bronze_optima_optima_advanced].[hoursassignment] ah      ON apa.patternassignmentid = ah.patternassignmentid
+LEFT JOIN [bronze_optima_optima_managed].[hoursassignment] mh       ON ah.hoursassignmentid = mh.hoursassignmentid
+WHERE mh.assigned_gradetypename = 'NURSE'
+  AND mh.staffnumber NOT LIKE '%Test%' COLLATE SQL_Latin1_General_CP1_CI_AS
+  AND mh.cancelreasondescription IS NULL
+  --AND validto >= CAST(GETDATE() AS DATE)
+  AND p._fivetran_deleted = 0
+ORDER BY 
+    [pattern_id],
+    [week_index],
+    [offset],
+    [roster_location];

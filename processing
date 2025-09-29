@@ -1,0 +1,294 @@
+import os
+import pyodbc
+import pandas as pd
+import numpy as np
+import re
+import logging
+import psycopg2
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.sql import text
+from tqdm import tqdm
+
+# Set the display option to show all columns
+pd.options.display.max_columns = None
+# Opt-in to the future pandas behavior
+pd.set_option('future.no_silent_downcasting', True)
+# Load environment variables from .env file
+load_dotenv()
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Centralized SQL file directory
+SQL_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def get_sql_file_path(file_name):
+    return os.path.join(SQL_FILE_DIR, file_name)
+
+# Function to connect to Azure SQL Database
+def connect_to_azure_sql(server, database, username, password):
+    try:
+        connection_string = (
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={server};"
+            f"DATABASE={database};"
+            f"UID={username};"
+            f"PWD={password}"
+        )
+        connection = pyodbc.connect(connection_string)
+        logging.info("Connected to Azure SQL Database.")
+        return connection
+    except Exception as e:
+        logging.error(f"Error connecting to Azure SQL Database: {e}")
+        raise
+
+# Function to load SQL query from file
+def load_query_from_file(file_name):
+    try:
+        file_path = get_sql_file_path(file_name)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File '{file_name}' not found at {file_path}.")
+        with open(file_path, 'r') as file:
+            return file.read()
+    except Exception as e:
+        logging.error(f"Error loading SQL query from file '{file_name}': {e}")
+        raise
+
+def get_db_credentials(prefix):
+    return {
+        "server": os.getenv(f"{prefix}_SERVER"),
+        "database": os.getenv(f"{prefix}_DATABASE"),
+        "username": os.getenv(f"{prefix}_USERNAME"),
+        "password": os.getenv(f"{prefix}_PASSWORD")
+    }
+
+def create_sqlalchemy_engine(credentials):
+    return create_engine(
+        f"mssql+pyodbc://{credentials['username']}:{credentials['password']}@{credentials['server']}/{credentials['database']}?driver=ODBC+Driver+17+for+SQL+Server",
+        fast_executemany=True
+    )
+# Fetch data as DataFrame with alias name correction
+def fetch_data_as_dataframe(connection, query):
+    try:
+        cursor = connection.cursor()
+        cursor.execute(query)
+        
+        # Get column names **with aliases applied in the SQL query**
+        column_names = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        df = pd.DataFrame.from_records(rows, columns=column_names)
+
+        if df.empty:
+            logging.warning("Query returned no data.")
+        return df
+
+    except Exception as e:
+        logging.error(f"Error executing query: {e}")
+        raise
+    
+# Function to load and execute SQL queries
+def execute_sql_file(connection, sql_files):
+    dataframes = {}
+    for sql_file in sql_files:
+        query = load_query_from_file(sql_file)
+        df_name = sql_file.split('.')[0]
+        dataframes[df_name] = fetch_data_as_dataframe(connection, query)
+        logging.info(f"DataFrame '{df_name}' created with {len(dataframes[df_name])} rows.")
+    return dataframes
+
+def create_table_if_not_exists(engine, table_name, create_query):
+    with engine.begin() as conn:
+        conn.execute(text(create_query))
+        logging.info(f"Table '{table_name}' checked/created successfully.")
+
+def adjust_data_types(df, date_columns=None, time_columns=None, float_columns=None, int_columns=None):
+    df = df.copy()  # prevent SettingWithCopyWarning
+    
+    if date_columns:
+        for col in date_columns:
+            if col in df:
+                df.loc[:, col] = pd.to_datetime(df[col], errors='coerce')
+    if time_columns:
+        for col in time_columns:
+            if col in df:
+                #df.loc[:, col] = pd.to_datetime(df[col], errors='coerce').dt.time
+                df.loc[:, col] = pd.to_datetime(df[col], format='%H:%M', errors='coerce').dt.time
+    if float_columns:
+        existing = [c for c in float_columns if c in df]
+        df.loc[:, existing] = df[existing].fillna(0).astype(float)
+    if int_columns:
+        existing = [c for c in int_columns if c in df]
+        df.loc[:, existing] = df[existing].fillna(0).astype(int)
+
+    logging.info("Adjusted data types:")
+    logging.info(df.dtypes)
+    return df
+def insert_dataframe_to_azure(df, engine, table_name, schema="dbo", chunksize=1000):
+    if df.empty:
+        logging.error(f"{table_name} is empty. No data to insert.")
+        return
+    try:
+        # Truncate the table before inserting new data
+        with engine.begin() as conn:
+            # Truncate table before inserting new data
+            conn.execute(text(f"TRUNCATE TABLE {schema}.{table_name}"))
+            logging.info(f"Table '{table_name}' truncated successfully.")
+
+        # Insert the DataFrame into Azure SQL with a progress bar    
+        with tqdm(total=len(df), desc=f"Inserting data into {table_name}", unit="rows") as pbar:
+            for start in range(0, len(df), chunksize):
+                chunk = df.iloc[start:start + chunksize].copy()
+                chunk.to_sql(table_name, engine, if_exists="append", index=False, chunksize=chunksize, schema=schema)
+                pbar.update(len(chunk))
+        logging.info(f"Data inserted successfully into {table_name}.")
+    except Exception as e:
+        logging.error(f"Error inserting data into {table_name}: {e}")
+
+def main_table():
+    azure_prod_credentials = get_db_credentials("AZURE_PROD")
+    azure_dev_credentials = get_db_credentials("AZURE_DEV")
+    #postgres_credentials = get_db_credentials("POSTGRES")
+    
+    if not all(azure_prod_credentials.values()): #or not all(postgres_credentials.values())
+        logging.error("Azure Prod database credentials are missing.")
+        return
+    if not all(azure_dev_credentials.values()): #or not all(postgres_credentials.values())
+        logging.error("Azure Dev database credentials are missing.")
+        return
+    engine_prod = create_sqlalchemy_engine(azure_prod_credentials)
+    azure_prod_conn = connect_to_azure_sql(**azure_prod_credentials)
+
+    engine_dev = create_sqlalchemy_engine(azure_dev_credentials)
+    azure_dev_conn = connect_to_azure_sql(**azure_dev_credentials)
+    #postgres_conn = connect_to_postgres(**postgres_credentials)
+    
+    # Define separate lists for SQL files
+    azure_dev_files = ["fetch_active_nurse.sql", "fetch_optima_pattern.sql"]
+    azure_prod_files = ["fetch_contracted_hour.sql"]
+    # Execute queries separately
+    azure_prod_data = execute_sql_file(azure_prod_conn, azure_prod_files)
+    azure_dev_data = execute_sql_file(azure_dev_conn, azure_dev_files)
+   
+    # Print the dataframes
+    ''' 
+    print("\n=== DataFrame: fetch_contracted_hour ===")
+    print(azure_prod_data["fetch_contracted_hour"])
+
+    print("\n=== DataFrame: fetch_optima_pattern ===")
+    print(azure_dev_data["fetch_optima_pattern"])
+    '''
+    # Load the DataFrames
+    df_active_nurse = azure_dev_data["fetch_active_nurse"]
+    df_contracted = azure_prod_data["fetch_contracted_hour"]
+    df_optima = azure_dev_data["fetch_optima_pattern"]
+
+    # Replace empty strings with None if needed
+    df_contracted.replace({np.nan: None})
+    df_optima.replace({np.nan: None})
+    df_active_nurse.replace({np.nan: None})
+
+    # 1️. Merge contracted + optima, match on employee_id + week_index + day_name
+    merge_1 = pd.merge(
+        df_contracted,
+        df_optima,
+        on=["employee_id", "week_index", "day_name"],
+        how="outer",
+        suffixes=("_contracted", "_optima")
+    )
+
+    # 1.1. Drop duplicate rows by employee_id + week_index + day_name (if they appear more than once)
+    merge_1 = merge_1.drop_duplicates(subset=["employee_id", "week_index", "day_name"])
+    # 1.2. Fill NaNs with None
+    merge_1 = merge_1.where(pd.notnull(merge_1), None)
+    
+    # 2. Rename active nurse columns to avoid collision
+    df_active_nurse = df_active_nurse.rename(columns={
+        "forenames": "forenames_active",
+        "surname": "surname_active"
+    })
+    # 2.1 Merge with active nurse
+    final_merged = pd.merge(
+        merge_1,
+        df_active_nurse,
+        on="employee_id",
+        how="inner"
+    )
+    # 3. Add unified names with fallback logic (active → contracted → optima)
+    final_merged["forenames"] = (
+        final_merged.get("forenames_active")
+        .combine_first(final_merged.get("forenames_contracted"))
+        .combine_first(final_merged.get("forenames_optima"))
+    )
+    final_merged["surname"] = (
+        final_merged.get("surname_active")
+        .combine_first(final_merged.get("surname_contracted"))
+        .combine_first(final_merged.get("surname_optima"))
+    )
+
+    # 2.2. Check which columns actually exist in the merged DataFrame
+    existing_columns = final_merged.columns.tolist()
+    # 3. Select only final output columns
+    final_columns = [
+        'employee_id', 'forenames', 'surname', 'qualification',
+        'week_index', 'day_name', 'contracted_hours', 'contracted_location', 'note', 
+        'last_updated_date', 'pattern_id', 'pattern_name', 'pattern_valid_from',
+        'pattern_valid_to', 'roster_location', 'shift_type', 'shift_name',
+        'start_time', 'end_time', 'work_time_hrs', 'offset', 'shift_id',
+        'roster_location_id', 'team_id'
+    ]
+
+    # 4. Filter only those columns that exist in the dataframe
+    valid_final_columns = [col for col in final_columns if col in existing_columns]
+
+    final_df = final_merged[valid_final_columns]
+
+    final_df = adjust_data_types(final_df, 
+                                 date_columns=["last_updated_date", "pattern_valid_from", "pattern_valid_to"], 
+                                 time_columns=["start_time", "end_time"],
+                                 float_columns=["contracted_hours", "work_time_hrs"], 
+                                 int_columns=["week_index", "pattern_id", "offset", "shift_id", "roster_location_id", "team_id"]
+                                 )    
+    # Sort the final DataFrame
+    final_df = final_df.sort_values(by=['employee_id', 'week_index', 'offset'])
+    # Print result
+    print("\n=== Final Merged DataFrame ===")
+    print(final_df)
+    #final_df.to_csv('nurse_WFP.csv', index=False)
+    
+    create_table_if_not_exists(engine_prod, "nurse_workforceplan_pattern", """
+    IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'nurse_workforceplan_pattern' AND TABLE_SCHEMA = 'dbo')
+    BEGIN
+        CREATE TABLE [dbo].[nurse_workforceplan_pattern] (
+            [employee_id]           VARCHAR(20) NULL,
+            [forenames]             VARCHAR(30) NULL,
+            [surname]               VARCHAR(30) NULL,
+            [qualification]         VARCHAR(20) NULL,          
+            [week_index]            INT NULL,
+            [day_name]              VARCHAR(10) NULL,
+            [contracted_hours]      FLOAT NULL,
+            [contracted_location]   VARCHAR(500) NULL,
+            [note]                  VARCHAR(500) NULL, 
+            [last_updated_date]     DATE NULL,
+            [pattern_id]            INT NULL,
+            [pattern_name]          VARCHAR(200) NULL,
+            [pattern_valid_from]    DATE NULL,
+            [pattern_valid_to]      DATE NULL,
+            [roster_location]       VARCHAR(200) NULL, 
+            [shift_type]            VARCHAR(10) NULL,
+            [shift_name]            VARCHAR(20) NULL,
+            [start_time]            TIME NULL,
+            [end_time]              TIME NULL, 
+            [work_time_hrs]         FLOAT NULL,
+            [offset]                INT NULL,    
+            [shift_id]              INT NULL, 
+            [roster_location_id]    INT NULL,
+            [team_id]               INT NULL    
+        );
+    END
+    """)
+
+    insert_dataframe_to_azure(final_df, engine_prod, "nurse_workforceplan_pattern")
+
+if __name__ == "__main__":
+    main_table()

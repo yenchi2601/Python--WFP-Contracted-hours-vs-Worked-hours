@@ -1,0 +1,15 @@
+SELECT 
+     employee_id
+    ,forenames
+    ,surname
+    --,qualification
+    ,week_index
+    ,day_name
+    ,contracted_hours
+    ,contracted_location
+    ,note
+    ,CAST(DATEADD(DAY, CAST([last_updated_date] AS INT) - 2, '1900-01-01') AS DATE) AS last_updated_date
+FROM [sharepoint_hr].[nurse_contracted_hour]
+ORDER BY    
+    employee_id,
+    week_index
